@@ -1,16 +1,16 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from moviepy.editor import (
-    ImageClip,
-    AudioFileClip,
-    concatenate_videoclips,
-)
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 
-from backend.script_engine import generate_ad_json
-from backend.voice import synthesize
+# ✅ IMPORTANT: absolute imports (fixes "No module named backend" on cloud)
+from ad_video_generator.backend.script_engine import generate_ad_json
+from ad_video_generator.backend.voice import synthesize
 
 W, H = 1080, 1920
 
@@ -31,6 +31,7 @@ def make_gradient_bg() -> Image.Image:
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont:
+    # Windows fonts (local dev)
     candidates = [
         r"C:\Windows\Fonts\arialbd.ttf",
         r"C:\Windows\Fonts\arial.ttf",
@@ -48,7 +49,9 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
 
 def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> List[str]:
     words = text.split()
-    lines, cur = [], []
+    lines: List[str] = []
+    cur: List[str] = []
+
     for w in words:
         test = " ".join(cur + [w])
         bbox = draw.textbbox((0, 0), test, font=font)
@@ -59,6 +62,7 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, m
             if cur:
                 lines.append(" ".join(cur))
             cur = [w]
+
     if cur:
         lines.append(" ".join(cur))
     return lines
@@ -71,7 +75,7 @@ def draw_centered_text_block(
     font: ImageFont.ImageFont,
     fill=(255, 255, 255),
     shadow=True,
-    line_gap=18
+    line_gap=18,
 ) -> None:
     draw = ImageDraw.Draw(img)
 
@@ -96,7 +100,7 @@ def draw_centered_text_block(
 def build_frame(
     on_screen_lines: List[str],
     footer: str = "Swipe up / Learn more",
-    badge: str | None = None
+    badge: Optional[str] = None,
 ) -> np.ndarray:
     bg = make_gradient_bg()
     draw = ImageDraw.Draw(bg)
@@ -120,7 +124,7 @@ def build_frame(
         draw.text((x + 2, y + 2), line, font=font_footer, fill=(0, 0, 0))
         draw.text((x, y), line, font=font_footer, fill=(255, 255, 255))
 
-    # Badge (like "SALE", "NEW", "LIMITED")
+    # Badge
     if badge:
         font_badge = load_font(48)
         text = badge.strip()
@@ -137,21 +141,27 @@ def build_frame(
 
 
 # -----------------------------
-# Pillow-safe zoom helper (fixes ANTIALIAS crash)
+# Pillow-safe zoom helper
 # -----------------------------
+def _lanczos():
+    # Pillow compatibility: Resampling.LANCZOS (new) vs Image.LANCZOS (old)
+    if hasattr(Image, "Resampling"):
+        return Image.Resampling.LANCZOS
+    return Image.LANCZOS
+
+
 def zoom_frame(frame: np.ndarray, scale: float) -> np.ndarray:
     """
-    Zoom a frame safely using Pillow's modern resampling (no ANTIALIAS).
-    Output stays exactly W x H by center-cropping.
+    Zoom frame safely with Pillow and center-crop back to W x H.
     """
     if scale <= 1.0:
         return frame
 
     img = Image.fromarray(frame)
-    new_w = int(W * scale)
-    new_h = int(H * scale)
+    new_w = max(int(W * scale), W)
+    new_h = max(int(H * scale), H)
 
-    img2 = img.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
+    img2 = img.resize((new_w, new_h), resample=_lanczos())
 
     left = (new_w - W) // 2
     top = (new_h - H) // 2
@@ -160,28 +170,23 @@ def zoom_frame(frame: np.ndarray, scale: float) -> np.ndarray:
 
 
 # -----------------------------
-# Animations (simple but effective)
+# Motion + text timing
 # -----------------------------
 def apply_scene_motion(clip: ImageClip, mode: str, dur: float) -> ImageClip:
-    """
-    Adds subtle zoom/pan WITHOUT moviepy.resize (avoids PIL.Image.ANTIALIAS crash).
-    """
     mode = (mode or "").lower()
+    dur = max(float(dur), 0.001)
 
-    def fl_func(get_frame, t):
-        frame = get_frame(t)
-
+    def transform(frame: np.ndarray, t: float) -> np.ndarray:
         # default gentle zoom
-        z = 1.0 + 0.04 * (t / max(dur, 0.001))
+        z = 1.0 + 0.04 * (t / dur)
 
         if "zoom" in mode:
-            z = 1.0 + 0.06 * (t / max(dur, 0.001))
+            z = 1.0 + 0.06 * (t / dur)
         elif "shake" in mode:
-            z = 1.0 + 0.03 * (t / max(dur, 0.001))
+            z = 1.0 + 0.03 * (t / dur)
 
         out = zoom_frame(frame, z)
 
-        # optional micro jitter for shake
         if "shake" in mode and t < 0.6:
             dx = int(4 * np.sin(45 * t))
             dy = int(4 * np.cos(38 * t))
@@ -189,33 +194,28 @@ def apply_scene_motion(clip: ImageClip, mode: str, dur: float) -> ImageClip:
 
         return out
 
-    return clip.fl(fl_func, apply_to=["mask"])
+    # ✅ MoviePy-safe: per-frame effect
+    return clip.fl_image(lambda frame: transform(frame, clip.t))
 
 
 def apply_text_animation_timing(clip: ImageClip, anim: str) -> ImageClip:
-    """
-    Fake "text animation" by using in/out effects on the whole frame.
-    Pillow-safe (no moviepy.resize).
-    """
     anim = (anim or "").lower()
 
     if anim in ("pop_in", "cta_bounce"):
-        # quick zoom-in effect for first 0.25s
-        def fl_func(get_frame, t):
-            frame = get_frame(t)
+        def transform(frame: np.ndarray, t: float) -> np.ndarray:
             s = 0.92 + 0.08 * min(t / 0.25, 1.0)
             return zoom_frame(frame, s)
 
-        return clip.fl(fl_func, apply_to=["mask"])
+        return clip.fl_image(lambda frame: transform(frame, clip.t))
 
     if anim in ("slide_up",):
         return clip.set_position(lambda t: (0, int(40 * (1 - min(t / 0.35, 1.0)))))
 
     if anim in ("swipe_cut", "split_wipe"):
-        return clip.set_position(lambda t: (0 + int(6 * np.sin(35 * t)) if t < 0.25 else 0, 0))
+        return clip.set_position(lambda t: (int(6 * np.sin(35 * t)) if t < 0.25 else 0, 0))
 
     if anim in ("type_on", "glitch"):
-        return clip.set_position(lambda t: (0 + int(3 * np.sin(50 * t)) if t < 0.6 else 0, 0))
+        return clip.set_position(lambda t: (int(3 * np.sin(50 * t)) if t < 0.6 else 0, 0))
 
     return clip
 
@@ -228,8 +228,9 @@ async def make_scene(scene: Dict[str, Any], idx: int, tmp_dir: Path) -> ImageCli
     if dur <= 0:
         dur = 1.0
 
-    badge = None
+    badge: Optional[str] = None
     on_screen = scene.get("on_screen_text", []) or []
+
     if scene.get("overlay"):
         for item in scene["overlay"]:
             if isinstance(item, str) and item.upper() in ("SALE", "NEW", "LIMITED TIME", "LIMITED"):
@@ -249,7 +250,7 @@ async def make_scene(scene: Dict[str, Any], idx: int, tmp_dir: Path) -> ImageCli
 
     audio = AudioFileClip(str(vo_path))
 
-    # ✅ Safe duration matching
+    # Duration matching
     if audio.duration and audio.duration > dur:
         audio = audio.subclip(0, dur)
         clip = ImageClip(str(img_path)).set_duration(dur)
@@ -278,8 +279,7 @@ async def make_ad_video(meta: Dict[str, Any], out_path: Path) -> None:
 
     clips: List[ImageClip] = []
     for i, scene in enumerate(scenes):
-        clip = await make_scene(scene, i, tmp_dir)
-        clips.append(clip)
+        clips.append(await make_scene(scene, i, tmp_dir))
 
     final = concatenate_videoclips(clips, method="compose")
 
@@ -288,5 +288,5 @@ async def make_ad_video(meta: Dict[str, Any], out_path: Path) -> None:
         fps=30,
         codec="libx264",
         audio_codec="aac",
-        threads=2
+        threads=2,
     )
